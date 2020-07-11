@@ -1,25 +1,28 @@
-import struct
-from copy import copy
 from enum import IntEnum
-from typing import List
+from typing import List, Dict
 import numpy as np
 
-from ..source2 import ValveFile
+try:
+    from ..utils.PySourceIOUtils import (decode_vertex_buffer as decode_vertex_buffer_, \
+                                         decode_index_buffer as decode_index_buffer_)
+
+
+    def decode_vertex_buffer(data, size, count):
+        return decode_vertex_buffer_(data, len(data), size, count)
+
+
+    def decode_index_buffer(data, size, count):
+        return decode_index_buffer_(data, len(data), size, count)
+
+except ImportError:
+    print("Failed to import native binary!\nUsing python version")
+    from ..utils.compressed_buffers import decode_vertex_buffer, decode_index_buffer, slice
+
+from ..utils.compressed_buffers import slice
 from ...byte_io_mdl import ByteIO
 
-from .common import SourceVertex, SourceVector, short_to_float, SourceVector4D, SourceVector2D
-from .header_block import InfoBlock
+from ..common import SourceVertex, short_to_float
 from .dummy import DataBlock
-
-
-def unzigzag8(v):
-    return (-(v & 1) ^ (v >> 1)) & 0xFF
-
-
-def slice(data: np.ndarray, start, len=None):
-    if len is None:
-        len = data.size - start
-    return data[start:start + len]
 
 
 class DxgiFormat(IntEnum):
@@ -144,26 +147,17 @@ class DxgiFormat(IntEnum):
     V408 = 132,
 
 
-index_header = 0xe0
-vertex_header = 0xa0
-vertex_block_size_bytes = 8192
-vertex_block_max_size = 256
-byte_group_size = 16
-tail_max_size = 32
-
-
 class VertexBuffer:
     def __init__(self):
         super().__init__()
         self.vertex_count = 0
         self.vertex_size = 0
-        self.attributes_offset = 0
-        self.attributes_count = 0
         self.offset = 0
         self.total_size = 0
         self.attributes = []  # type:List[VertexAttribute]
         self.buffer = ByteIO()  # type: ByteIO
-        self.vertexes = []  # type: List[SourceVertex]
+        # self.vertexes = []  # type: List[SourceVertex]
+        self.vertexes = {}  # type: Dict[str,List]
         self.vertex_struct = ''
 
     def __repr__(self):
@@ -172,18 +166,18 @@ class VertexBuffer:
             buff += attrib.name + ' ' + attrib.format.name + '; '
         return '<VertexBuffer vertexes:{} ' \
                'attributes:{} vertex size:{} ' \
-               'vertex attributes: {} >'.format(self.vertex_count, self.attributes_count, self.vertex_size, buff, )
+               'vertex attributes: {} >'.format(self.vertex_count, len(self.attributes), self.vertex_size, buff, )
 
     def read(self, reader: ByteIO):
         self.vertex_count = reader.read_uint32()
         self.vertex_size = reader.read_uint32()
         entry = reader.tell()
-        self.attributes_offset = reader.read_uint32()
-        self.attributes_count = reader.read_uint32()
+        attributes_offset = reader.read_uint32()
+        attributes_count = reader.read_uint32()
         with reader.save_current_pos():
-            reader.seek(entry + self.attributes_offset)
+            reader.seek(entry + attributes_offset)
             used_names = []
-            for _ in range(self.attributes_count):
+            for _ in range(attributes_count):
                 v_attrib = VertexAttribute()
                 v_attrib.read(reader)
                 if v_attrib.name in used_names:
@@ -200,197 +194,50 @@ class VertexBuffer:
         with reader.save_current_pos():
             reader.seek(entry + self.offset)
             if self.total_size != self.vertex_size * self.vertex_count:
-                self.buffer.write_bytes(self.decode_vertex_buffer(reader.read_bytes(self.total_size)))
+                data = reader.read_bytes(self.total_size)
+                self.buffer.write_bytes(decode_vertex_buffer(data, self.vertex_size, self.vertex_count))
             else:
                 self.buffer.write_bytes(reader.read_bytes(self.vertex_count * self.vertex_size))
             self.buffer.seek(0)
         self.read_buffer()
 
     def read_buffer(self):
-        for n in range(self.vertex_count):
-            vertex = SourceVertex()
-            vertex_data = self.buffer.read_fmt(self.vertex_struct)
+        for attrib in self.attributes:
+            self.vertexes[attrib.name] = []
+        for _ in range(self.vertex_count):
+            vertex_data = list(self.buffer.read_fmt(self.vertex_struct))
             offset = 0
             for attrib in self.attributes:
                 attrib_len = attrib.element_count
                 if attrib.name == 'POSITION':
-                    vertex.position = slice(vertex_data, offset, attrib_len)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif 'TEXCOORD' in attrib.name:
-                    if "_" in attrib.name:
-                        t_id = int(attrib.name.split("_")[-1])
-                    else:
-                        t_id = 0
-                    if vertex.uvs.get(t_id, None) is None:
-                        vertex.uvs[t_id] = []
-
-                    vertex.uvs[t_id] = slice(vertex_data, offset, attrib_len)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif attrib.name == 'COLOR':
-                    vertex.color = slice(vertex_data, offset, attrib_len)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif attrib.name == 'NORMAL':
-                    vertex.normal = slice(vertex_data, offset, attrib_len)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif attrib.name == 'TANGENT':
-                    vertex.tangent = slice(vertex_data, offset, attrib_len)
-                elif attrib.name == 'texcoord':
-                    vertex.lightmap = slice(vertex_data, offset, attrib_len)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
+                elif 'texcoord' in attrib.name:
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif attrib.name == "BLENDINDICES":
-                    vertex.bone_weight.bone = slice(vertex_data, offset, attrib_len)
-                    vertex.bone_weight.boneCount = len(vertex.bone_weight.bone)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 elif attrib.name == "BLENDWEIGHT":
-                    vertex.bone_weight.weight = np.divide(slice(vertex_data, offset, attrib_len), 255)
+                    self.vertexes[attrib.name].append(slice(vertex_data, offset, attrib_len))
                 else:
                     print(f"UNKNOWN ATTRIBUTE {attrib.name}!!!!")
                 offset += attrib_len
-            self.vertexes.append(vertex)
-
-    @staticmethod
-    def decode_bytes_group(data, destination, bitslog2):
-        data_offset = 0
-        data_var = 0
-        b = 0
-
-        def next(bits, encv):
-            enc = b >> (8 - bits)
-            is_same = enc == (1 << bits) - 1
-            return (b << bits) & 0xFF, data_var + is_same, encv if is_same else enc & 0xFF
-
-        if bitslog2 == 0:
-            for k in range(byte_group_size):
-                destination[k] = 0
-            return data
-        elif bitslog2 == 1:
-            data_var = 4
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[0] = next(2, data[data_var])
-            b, data_var, destination[1] = next(2, data[data_var])
-            b, data_var, destination[2] = next(2, data[data_var])
-            b, data_var, destination[3] = next(2, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[4] = next(2, data[data_var])
-            b, data_var, destination[5] = next(2, data[data_var])
-            b, data_var, destination[6] = next(2, data[data_var])
-            b, data_var, destination[7] = next(2, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[8] = next(2, data[data_var])
-            b, data_var, destination[9] = next(2, data[data_var])
-            b, data_var, destination[10] = next(2, data[data_var])
-            b, data_var, destination[11] = next(2, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[12] = next(2, data[data_var])
-            b, data_var, destination[13] = next(2, data[data_var])
-            b, data_var, destination[14] = next(2, data[data_var])
-            b, data_var, destination[15] = next(2, data[data_var])
-
-            return slice(data, data_var)
-        elif bitslog2 == 2:
-            data_var = 8
-
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[0] = next(4, data[data_var])
-            b, data_var, destination[1] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[2] = next(4, data[data_var])
-            b, data_var, destination[3] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[4] = next(4, data[data_var])
-            b, data_var, destination[5] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[6] = next(4, data[data_var])
-            b, data_var, destination[7] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[8] = next(4, data[data_var])
-            b, data_var, destination[9] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[10] = next(4, data[data_var])
-            b, data_var, destination[11] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[12] = next(4, data[data_var])
-            b, data_var, destination[13] = next(4, data[data_var])
-            b = data[data_offset]
-            data_offset += 1
-            b, data_var, destination[14] = next(4, data[data_var])
-            b, data_var, destination[15] = next(4, data[data_var])
-            return slice(data, data_var)
-
-        elif bitslog2 == 3:
-            destination[:byte_group_size] = data[0:byte_group_size]
-            return slice(data, byte_group_size)
-        else:
-            raise Exception("Unexpected bit length")
-
-    def decode_bytes(self, data: np.ndarray, destination: np.ndarray):
-        assert destination.size % byte_group_size == 0, "Expected data length to be a multiple of ByteGroupSize."
-        header_size = ((destination.size // byte_group_size) + 3) // 4
-        header = slice(data, 0)
-        data: np.ndarray = slice(data, header_size)
-        for i in range(0, destination.size, byte_group_size):
-            assert data.size >= tail_max_size, "Cannot decode"
-            header_offset = i // byte_group_size
-            bitslog2 = (header[header_offset // 4] >> ((header_offset % 4) * 2)) & 3
-            data = self.decode_bytes_group(data, slice(destination, i), bitslog2)
-        return data
-
-    def get_vertex_block_size(self):
-        result = vertex_block_size_bytes // self.vertex_size
-        result &= ~(byte_group_size - 1)
-        return result if result < vertex_block_max_size \
-            else vertex_block_max_size
-
-    def decode_vertex_block(self, data: np.ndarray, vertex_data: np.ndarray, vertex_count, last_vertex: np.ndarray):
-        assert 0 < vertex_count <= vertex_block_max_size, \
-            f"Expected vertexCount({vertex_count}) to be between 0 and VertexMaxBlockSize"
-        buffer = np.zeros((vertex_block_max_size,), dtype=np.uint8)
-        transposed = np.zeros((vertex_block_size_bytes,), dtype=np.uint8)
-        vertex_count_aligned = (vertex_count + byte_group_size - 1) & ~(
-                byte_group_size - 1)
-        for k in range(self.vertex_size):
-            data = self.decode_bytes(data, slice(buffer, 0, vertex_count_aligned))
-            vertex_offset = k
-            p = last_vertex[k]
-            for i in range(vertex_count):
-                a = buffer[i]
-                v = (((-(a & 1) ^ (a >> 1)) & 0xFF) + p) & 0xFF
-                transposed[vertex_offset] = v
-                p = v
-                vertex_offset += self.vertex_size
-        vertex_data[:vertex_count * self.vertex_size] = slice(transposed, 0, vertex_count * self.vertex_size)
-        last_vertex[:self.vertex_size] = slice(transposed, self.vertex_size * (vertex_count - 1), self.vertex_size)
-        return data
-
-    def decode_vertex_buffer(self, buffer: bytes):
-        buffer: np.ndarray = np.array(list(buffer), dtype=np.uint8)
-        assert 0 < self.vertex_size < 256, f"Vertex size is expected to be between 1 and 256 = {self.vertex_size}"
-        assert self.vertex_size % 4 == 0, "Vertex size is expected to be a multiple of 4."
-        assert len(buffer) > 1 + self.vertex_size, "Vertex buffer is too short."
-        vertex_span = buffer.copy()
-        header = vertex_span[0]
-        assert header == vertex_header, \
-            f"Invalid vertex buffer header, expected {vertex_header} but got {header}."
-        vertex_span: np.ndarray = slice(vertex_span, 1)
-        last_vertex: np.ndarray = slice(vertex_span, buffer.size - 1 - self.vertex_size, self.vertex_size)
-        vertex_block_size = self.get_vertex_block_size()
-        vertex_offset = 0
-        result = np.zeros((self.vertex_count * self.vertex_size,), dtype=np.uint8)
-
-        while vertex_offset < self.vertex_count:
-            print(f"BLOCK {vertex_offset}/{self.vertex_count}")
-            block_size = vertex_block_size if vertex_offset + vertex_block_size < self.vertex_count else \
-                self.vertex_count - vertex_offset
-            vertex_span = self.decode_vertex_block(vertex_span, slice(result, vertex_offset * self.vertex_size),
-                                                   block_size,
-                                                   last_vertex)
-            vertex_offset += block_size
-        return bytes(result)
+        for attrib in self.attributes:
+            attrib_array = self.vertexes[attrib.name]
+            # if "UNORM" in attrib.format.name:
+            #     attrib_array = list(np.array(attrib_array) / 255.0)
+            # elif "SNORM" in attrib.format.name:
+            #     attrib_array = list(
+            #         np.array(attrib_array) / 128.0)
+            if attrib.name == "BLENDWEIGHT":
+                attrib_array = list(np.array(attrib_array) / 255.0)
+            self.vertexes[attrib.name] = attrib_array
 
 
 class VertexAttribute:
@@ -444,6 +291,8 @@ class VertexAttribute:
             return '4B'
         elif self.format == DxgiFormat.R8G8B8A8_UINT:
             return '4B'
+        elif self.format == DxgiFormat.R16G16_UNORM:
+            return '2H'
         else:
             raise NotImplementedError(f"UNSUPPORTED DXGI format {self.format.name}")
 
@@ -478,6 +327,10 @@ class VertexAttribute:
             return 4
         elif self.format == DxgiFormat.R8G8B8A8_UINT:
             return 4
+        elif self.format == DxgiFormat.R16G16_UNORM:
+            return 4
+        elif self.format == DxgiFormat.R16G16_UNORM:
+            return 2
         else:
             raise NotImplementedError(f"UNSUPPORTED DXGI format {self.format.name}")
 
@@ -512,6 +365,8 @@ class VertexAttribute:
             return reader.read_fmt(f'4B')
         elif self.format == DxgiFormat.R8G8B8A8_UINT:
             return reader.read_fmt(f'4B')
+        elif self.format == DxgiFormat.R16G16_UNORM:
+            return reader.read_fmt(f'2H')
         else:
             raise NotImplementedError(f"UNSUPPORTED DXGI format {self.format.name}")
 
@@ -541,171 +396,16 @@ class IndexBuffer:
         with reader.save_current_pos():
             reader.seek(entry + self.offset)
             if self.total_size != self.index_size * self.index_count:
-                self.buffer.write_bytes(self.decode_index_buffer(reader.read_bytes(self.total_size)))
+                data = reader.read_bytes(self.total_size)
+                self.buffer.write_bytes(decode_index_buffer(data, self.index_size, self.index_count))
             else:
                 self.buffer.write_bytes(reader.read_bytes(self.index_count * self.index_size))
             self.buffer.seek(0)
-        with open("test.bin", 'wb') as f:
-            f.write(self.buffer.read_bytes(-1))
+        # with open("test.bin", 'wb') as f:
+        #     f.write(self.buffer.read_bytes(-1))
         self.buffer.seek(0)
 
         self.read_buffer()
-
-    def decode_index_buffer(self, buffer: bytes):
-        buffer: np.ndarray = np.array(list(buffer), dtype=np.uint8)
-        assert self.index_count % 3 == 0, "Expected indexCount to be a multiple of 3."
-        assert self.index_size in [2, 4], "Expected indexSize to be either 2 or 4"
-        data_offset = 1 + (self.index_count // 3)
-        assert buffer.size >= data_offset + 16, "Index buffer is too short."
-        assert buffer[0] == index_header, "Incorrect index buffer header."
-        vertex_fifo = np.zeros((16,), dtype=np.uint32)
-        edge_fifo = np.zeros((16, 2), dtype=np.uint32)
-        edge_fifo_offset = 0
-        vertex_fifo_offset = 0
-
-        next = 0
-        last = 0
-
-        buffer_index = 1
-        data = slice(buffer, data_offset, buffer.size - 16 - data_offset)
-        codeaux_table = slice(buffer, buffer.size - 16)
-        destination = np.zeros((self.index_count * self.index_size),
-                               dtype=np.uint8)
-        ds = ByteIO(byte_object=bytes(data))
-        for i in range(0, self.index_count, 3):
-            code_tri = buffer[buffer_index]
-            buffer_index += 1
-
-            if code_tri < 0xF0:
-                fe = code_tri >> 4
-                a, b = edge_fifo[((edge_fifo_offset - 1 - fe) & 15)]
-                fec = code_tri & 15
-                if fec != 15:
-                    c = next if fec == 0 else vertex_fifo[(vertex_fifo_offset - 1 - fec) & 15]
-                    fec0 = fec == 0
-                    next += fec0
-                    self.write_triangle(destination, i, a, b, c)
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, c, fec0)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, c, b)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, a, c)
-                else:
-                    c = last = self.decode_index(ds, next, last)
-                    self.write_triangle(destination, i, a, b, c)
-
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, c)
-
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, c, b)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, a, c)
-            else:
-                if code_tri < 0xfe:
-                    codeaux = codeaux_table[code_tri & 15]
-                    feb = codeaux >> 4
-                    fec = codeaux & 15
-
-                    a = next
-                    next += 1
-
-                    b = next if feb == 0 else vertex_fifo[(vertex_fifo_offset - feb) & 15]
-                    feb0 = feb == 0
-                    next += feb0
-
-                    c = next if fec == 0 else vertex_fifo[(vertex_fifo_offset - fec) & 15]
-                    fec0 = 1 if not fec else 0
-                    next += fec0
-
-                    self.write_triangle(destination, i, a, b, c)
-
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, a)
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, b, feb0 == 1)
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, c, fec0 == 1)
-
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, b, a)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, c, b)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, a, c)
-                else:
-                    codeaux = ds.read_uint8()
-                    fea = 0 if code_tri == 0xfe else 15
-                    feb = codeaux >> 4
-                    fec = codeaux & 15
-
-                    if fea == 0:
-                        a = next
-                        next += 1
-                    else:
-                        a = 0
-
-                    if feb == 0:
-                        b = next
-                        next += 1
-                    else:
-                        b = vertex_fifo[(vertex_fifo_offset - feb) & 15]
-
-                    if fec == 0:
-                        c = next
-                        next += 1
-                    else:
-                        c = vertex_fifo[(vertex_fifo_offset - fec) & 15]
-
-                    if fea == 15:
-                        last = a = self.decode_index(ds, next, last)
-                    if feb == 15:
-                        last = b = self.decode_index(ds, next, last)
-                    if fec == 15:
-                        last = c = self.decode_index(ds, next, last)
-
-                    self.write_triangle(destination, i, a, b, c)
-
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, a)
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, b,
-                                                               (feb == 0) or (feb == 15))
-                    vertex_fifo_offset = self.push_vertex_fifo(vertex_fifo, vertex_fifo_offset, c,
-                                                               (fec == 0) or (fec == 15))
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, b, a)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, c, b)
-                    edge_fifo_offset = self.push_edge_fifo(edge_fifo, edge_fifo_offset, a, c)
-        assert ds.size() == ds.tell(), "we didn't read all data bytes and stopped before the boundary between data and codeaux table"
-        return bytes(destination)
-
-    def write_triangle(self, destination: np.ndarray, offset, a, b, c):
-        offset *= self.index_size
-        if self.index_size == 2:
-            ad = struct.pack('H', a)
-            bd = struct.pack('H', b)
-            cd = struct.pack('H', c)
-            destination[offset:offset + 6] = np.array(list(ad) + list(bd) + list(cd), dtype=np.uint8)
-        else:
-            ad = struct.pack('I', a)
-            bd = struct.pack('I', b)
-            cd = struct.pack('I', c)
-            destination[offset:offset + 12] = np.array(list(ad) + list(bd) + list(cd), dtype=np.uint8)
-
-    def push_vertex_fifo(self, fifo: np.ndarray, offset, v, cond=True):
-        fifo[offset] = v
-        return (offset + cond) & 15
-
-    def push_edge_fifo(self, fifo: np.ndarray, offset, a, b):
-        fifo[offset, :] = [a, b]
-        return (offset + 1) & 15
-
-    def decode_index(self, data: ByteIO, next, last):
-        v = self.decode_vbyte(data)
-        mm = 0xFF_FF_FF_FF if self.index_size == 4 else 0xFF_FF
-        d = ((v >> 1) ^ -(v & 1)) & mm
-        return (last + d) & mm
-
-    def decode_vbyte(self, data: ByteIO):
-        lead = data.read_uint8()
-        if lead < 128:
-            return lead
-        result = lead & 127
-        shift = 7
-        for i in range(4):
-            group = data.read_uint8()
-            result |= (group & 127) << shift
-            shift += 7
-            if group < 128:
-                break
-        return result
 
     def read_buffer(self):
         reader = self.buffer.read_uint32 if self.index_size == 4 else self.buffer.read_uint16
@@ -716,7 +416,7 @@ class IndexBuffer:
 
 class VBIB(DataBlock):
 
-    def __init__(self, valve_file: ValveFile, info_block):
+    def __init__(self, valve_file, info_block):
         super().__init__(valve_file, info_block)
         self.vertex_offset = 0
         self.vertex_count = 0

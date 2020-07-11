@@ -1,51 +1,57 @@
 import math
 import sys
 from pathlib import Path
-from pprint import pprint
-from typing import List, TextIO, Dict, Tuple
-from typing.io import BinaryIO
-import os.path
+from typing import List, BinaryIO, Union
 
 from ..byte_io_mdl import ByteIO
-from .blocks.common import SourceVector
-from .blocks.header_block import CompiledHeader, InfoBlock
-from .blocks.dummy import DataBlock
+from .common import SourceVector
+from .compiled_file_header import CompiledHeader, InfoBlock
+from ..utilities.path_utilities import backwalk_file_resolver
+from .blocks import DataBlock
 
 
 class ValveFile:
 
-    def __init__(self, filepath):
+    @classmethod
+    def parse_new(cls, filepath):
+        return cls(filepath)
+
+    def __init__(self, filepath, data_block_handler=None):
 
         # print('Reading {}'.format(filepath))
-        self.reader = ByteIO(path=filepath, copy_data_from_handle=False, )
+        self.reader = ByteIO(path=filepath, copy_data_from_handle=False)
         self.filepath = Path(filepath)
+        self.data_block_handler = data_block_handler
         self.filename = self.filepath.name
         self.header = CompiledHeader()
         self.header.read(self.reader)
         self.info_blocks = []  # type: List[InfoBlock]
-        self.data_blocks = []  # type: List[DataBlock]
+        self.data_blocks = []  # type: List[Union[DataBlock,None]]
         self.available_resources = {}
 
     def read_block_info(self):
-
+        self.info_blocks.clear()
+        self.data_blocks.clear()
+        self.reader.seek(4 * 4)
         for n in range(self.header.block_count):
             block_info = InfoBlock()
             block_info.read(self.reader)
             self.info_blocks.append(block_info)
+            self.data_blocks.append(None)
 
-        while self.info_blocks:
-            block_info = self.info_blocks.pop(0)
+        for i in range(len(self.info_blocks)):
+            block_info = self.info_blocks[i]
+            if self.data_blocks[i] is not None:
+                continue
             # print(block_info)
             with self.reader.save_current_pos():
                 self.reader.seek(block_info.entry + block_info.block_offset)
                 block_class = self.get_data_block_class(block_info.block_name)
                 if block_class is None:
-                    # print(f"Unknown block {block_info}")
-                    self.data_blocks.append(None)
+                    self.data_blocks[self.info_blocks.index(block_info)] = None
                     continue
                 block = block_class(self, block_info)
-                block.read()
-                self.data_blocks.append(block)
+                self.data_blocks[self.info_blocks.index(block_info)] = block
 
     def get_data_block(self, *, block_id=None, block_name=None):
         if block_id is None and block_name is None:
@@ -55,25 +61,29 @@ class ValveFile:
         if block_id is not None:
             if block_id == -1:
                 return None
-            return self.data_blocks[block_id]
+            block = self.data_blocks[block_id]
+            if not block.parsed:
+                block.reader.seek(0)
+                block.read()
+                block.parsed = True
+            return block
         if block_name is not None:
             blocks = []
             for block in self.data_blocks:
                 if block is not None:
                     if block.info_block.block_name == block_name:
+                        if not block.parsed:
+                            block.read()
+                            block.parsed = True
                         blocks.append(block)
             return blocks
 
     def get_data_block_class(self, block_name):
-        from .blocks.ntro_block import NTRO
-        from .blocks.redi_block import REDI
-        from .blocks.rerl_block import RERL
-        from .blocks.vbib_block import VBIB
-        from .blocks.data_block import DATA
-        from .blocks.kv3_block import KV3
-        from .blocks.texture_data_block import TextureData
-        if self.filepath.suffix=='.vtex_c':
-            data_block_class = TextureData
+        from .blocks import TextureBlock, DATA, NTRO, REDI, RERL, VBIB, MRPH
+        if self.filepath.suffix == '.vtex_c':
+            data_block_class = TextureBlock
+        elif self.filepath.suffix == '.vmorf_c':
+            data_block_class = MRPH
         else:
             data_block_class = DATA
         data_classes = {
@@ -81,15 +91,16 @@ class ValveFile:
             "REDI": REDI,
             "RERL": RERL,
             "VBIB": VBIB,
+            "VXVS": VBIB,
             "DATA": data_block_class,
-            "CTRL": KV3,
+            "CTRL": DATA,
             "MBUF": VBIB,
-            "MDAT": KV3,
-            "PHYS": KV3,
-            # "ASEQ": KV3,
-            # "AGRP": KV3,
-            # "ANIM": KV3,
-            "MRPH": KV3,
+            "MDAT": DATA,
+            "PHYS": DATA,
+            "ASEQ": DATA,
+            "AGRP": DATA,
+            "ANIM": DATA,
+            "MRPH": MRPH,
         }
         return data_classes.get(block_name, None)
 
@@ -107,16 +118,40 @@ class ValveFile:
         for block in relr_block.resources:
             print(block)
 
-    def check_external_resources(self):
-        relr_block = self.get_data_block(block_name="RERL")[0]
-        for block in relr_block.resources:
-            path = Path(block.resource_name)
-            asset = self.filepath.parent / path.with_suffix(path.suffix + '_c').name
-            if asset.exists():
-                self.available_resources[block.resource_name] = asset.absolute()
-                print('Found', path)
+    @staticmethod
+    def get_base_dir(full_path: Path, relative_path: Path):
+        addon_path = Path(full_path)
+        for p1, p2 in zip(reversed(addon_path.parts), reversed(relative_path.parts)):
+            if p1 == p2:
+                addon_path = addon_path.parent
             else:
-                print('Can\'t find', path)
+                break
+        return addon_path
+
+    # noinspection PyTypeChecker
+    def check_external_resources(self):
+        from .blocks.rerl_block import RERL
+        if self.get_data_block(block_name="RERL"):
+            relr_block: RERL = self.get_data_block(block_name="RERL")[0]
+
+            for block in relr_block.resources:
+                path = Path(block.resource_name)
+                asset = path.with_suffix(path.suffix + '_c')
+                asset = backwalk_file_resolver(Path(self.filepath).parent, asset)
+                if asset and asset.exists():
+                    self.available_resources[block.resource_name] = asset.absolute()
+                    # print('Found', path)
+                else:
+                    pass
+                    # print('Can\'t find', path)
+
+    def get_child_resource(self, name):
+        if self.available_resources.get(name, None) is not None:
+            res = ValveFile(self.available_resources.get(name))
+            res.read_block_info()
+            res.check_external_resources()
+            return res
+        return None
 
 
 def quaternion_to_euler_angle(w, x, y, z):

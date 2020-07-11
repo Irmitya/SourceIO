@@ -1,22 +1,11 @@
-import io
-import struct
-from copy import copy
 from enum import IntEnum, IntFlag
-from typing import List
 import numpy as np
 
-from ..source2 import ValveFile
 from ...byte_io_mdl import ByteIO
 
-from .header_block import InfoBlock
 from .dummy import DataBlock
-import sys
 
-# sys.path.append(r"D:\CPP\SourceIOTextureUtils\cmake-build-debug")
-try:
-    from PySourceIOTextureUtils import *
-except:
-    from .PySourceIOTextureUtils import *
+from ..utils.PySourceIOUtils import *
 
 
 class VTexFlags(IntFlag):
@@ -95,9 +84,9 @@ class VTexExtraData(IntEnum):
     COMPRESSED_MIP_SIZE = 4
 
 
-class TextureData(DataBlock):
+class TextureBlock(DataBlock):
 
-    def __init__(self, valve_file: ValveFile, info_block):
+    def __init__(self, valve_file, info_block):
         super().__init__(valve_file, info_block)
         self.version = 0
         self.flags = VTexFlags(0)
@@ -149,8 +138,8 @@ class TextureData(DataBlock):
                             self.compressed_mips.append(reader.read_uint32())
                     else:
                         self.extra_data.append((extra_type, reader.read_bytes(size)))
-        print(self.format)
-        self.read_image()
+        # print(self.format)
+        # self.read_image()
 
     def calculate_buffer_size_for_mip(self, mip_level):
         bytes_per_pixel = block_size(self.format)
@@ -219,13 +208,13 @@ class TextureData(DataBlock):
                 reader.skip(self.calculate_buffer_size_for_mip(i))
             return reader
 
-    def read_image(self):
+    def read_image(self, flip=True):
         reader = self._valve_file.reader
         reader.seek(self.info_block.absolute_offset + self.info_block.block_size)
         if self.format == VTexFormat.RGBA8888:
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
+            data = read_r8g8b8a8(data, self.width, self.height, flip)
             self.image_data = data
-
         elif self.format == VTexFormat.BC7:
             from .redi_block_types import SpecialDependencies
             redi = self._valve_file.get_data_block(block_name='REDI')[0]
@@ -237,23 +226,23 @@ class TextureData(DataBlock):
                             hemi_oct_rb = True
                             break
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
-            data = read_bc7(data, len(data), self.width, self.height, hemi_oct_rb)
+            data = read_bc7(data, self.width, self.height, hemi_oct_rb, flip)
             self.image_data = data
         elif self.format == VTexFormat.ATI1N:
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
-            data = read_ati1n(data, len(data), self.width, self.height)
+            data = read_ati1n(data, self.width, self.height, flip)
             self.image_data = data
         elif self.format == VTexFormat.ATI2N:
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
-            data = read_ati2n(data, len(data), self.width, self.height)
+            data = read_ati2n(data, self.width, self.height, flip)
             self.image_data = data
         elif self.format == VTexFormat.DXT1:
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
-            data = read_dxt1(data, len(data), self.width, self.height)
+            data = read_dxt1(data, self.width, self.height, flip)
             self.image_data = data
         elif self.format == VTexFormat.DXT5:
             data = self.get_decompressed_buffer(reader, 0).read_bytes(-1)
-            data = read_dxt5(data, len(data), self.width, self.height)
+            data = read_dxt5(data, self.width, self.height, flip)
             self.image_data = data
 
     def get_rgb_and_alpha(self):

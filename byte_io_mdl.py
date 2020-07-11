@@ -9,8 +9,10 @@ from io import BytesIO
 class OffsetOutOfBounds(Exception):
     pass
 
+
 def split(array, n=3):
     return [array[i:i + n] for i in range(0, len(array), n)]
+
 
 class ByteIO:
     @contextlib.contextmanager
@@ -56,7 +58,7 @@ class ByteIO:
     def preview_f(self):
         with self.save_current_pos():
             block = self.read_bytes(64)
-            hex_values = split(split(binascii.hexlify(block).decode().upper(),2),4)
+            hex_values = split(split(binascii.hexlify(block).decode().upper(), 2), 4)
             return [' '.join(b) for b in hex_values]
 
     def __repr__(self):
@@ -154,12 +156,10 @@ class ByteIO:
         return self.file.read(size)
 
     def read(self, t):
-        size = struct.calcsize(t)
-        return struct.unpack(t, self._read(size))[0]
+        return struct.unpack(t, self._read(struct.calcsize(t)))[0]
 
     def read_fmt(self, fmt):
-        size = struct.calcsize(fmt)
-        return struct.unpack(fmt, self._read(size))
+        return struct.unpack(fmt, self._read(struct.calcsize(fmt)))
 
     def read_uint64(self):
         return self.read('Q')
@@ -192,7 +192,7 @@ class ByteIO:
         return self.read('d')
 
     def read_ascii_string(self, length=None):
-        if length:
+        if length is not None:
             return bytes(''.join([chr(self.read_uint8()) for _ in range(
                 length)]), 'utf').strip(b'\x00').decode('utf')
 
@@ -209,12 +209,26 @@ class ByteIO:
     def read_from_offset(self, offset, reader, **reader_args):
         if offset > self.size():
             raise OffsetOutOfBounds()
-        # curr_offset = self.tell()
         with self.save_current_pos():
             self.seek(offset, io.SEEK_SET)
             ret = reader(**reader_args)
-        # self.seek(curr_offset, io.SEEK_SET)
         return ret
+
+    def read_source1_string(self, entry):
+        offset = self.read_int32()
+        if offset:
+            with self.save_current_pos():
+                self.seek(entry + offset)
+                return self.read_ascii_string()
+        else:
+            return ""
+
+    def read_source2_string(self):
+        entry = self.tell()
+        offset = self.read_int32()
+        with self.save_current_pos():
+            self.seek(entry + offset)
+            return self.read_ascii_string()
 
     # ------------ WRITE SECTION ------------ #
 
@@ -286,6 +300,9 @@ class ByteIO:
 
     def write_bytes(self, data):
         self._write(data)
+
+    def __bool__(self):
+        return self.tell() < self.size()
 
 
 if __name__ == '__main__':
